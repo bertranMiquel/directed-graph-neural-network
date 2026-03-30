@@ -18,8 +18,113 @@ try:
     import seaborn as sns
 except Exception:
     sns = None
+from collections import defaultdict
 
+        
 log = logging.getLogger("corr_connectivity_accuracy")
+
+DATASET_GROUPS = {
+    "homophilic": [
+        "citeseer_full",
+        "cora_ml",
+        "ogbn-arxiv",
+    ],
+    "heterophilic": [
+        "chameleon",
+        "squirrel",
+        "arxiv-year",
+        "snap-patents",
+        "roman-empire",
+    ],
+}
+
+MODEL_FAMILIES = ["gcn", "sage", "gat"]
+ALPHAS_ORDER = [0.0, 1.0, 0.5]
+
+
+def dataset_display_name(name: str) -> str:
+    return name.upper().replace("_", "-")
+
+
+def metric_display_name(name: str) -> str:
+    if name == "homophility":
+        return "HOM."
+    return name.upper()
+
+
+def normalize_model_name(model: str) -> str:
+    model = model.strip().lower()
+    mapping = {
+        "dir-gcn": "dir-gcn",
+        "dir_gcn": "dir-gcn",
+        "dirgcn": "dir-gcn",
+        "gcn": "gcn",
+        "dir-gat": "dir-gat",
+        "dir_gat": "dir-gat",
+        "dirgat": "dir-gat",
+        "gat": "gat",
+        # "dir-gcnii": "dir-gcnii",
+        # "dir_gcnii": "dir-gcnii",
+        # "dirgcnii": "dir-gcnii",
+        # "gcnii": "gcnii",
+        "dir-sage": "dir-sage",
+        "dir_sage": "dir-sage",
+        "dirsage": "dir-sage",
+        "sage": "sage",
+    }
+    return mapping.get(model, model.replace("_", "-"))
+
+
+def extract_alpha_from_text(text: str) -> float | None:
+    if text is None:
+        return None
+    m = re.search(r"(?:alpha|a)\s*=\s*([0-9.]+)", text.lower())
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def base_family_from_model(model: str) -> str:
+    model = normalize_model_name(model)
+    if model.startswith("dir-"):
+        return model[4:]
+    return model
+
+
+def format_model_for_table(model: str, alpha: float | None) -> str:
+    model = normalize_model_name(model)
+    fam = base_family_from_model(model).upper()
+
+    if model.startswith("dir-"):
+        if alpha is None:
+            return f"DIR-{fam}"
+        return f"DIR-{fam}($\\alpha$={alpha:.1f})"
+    return fam
+
+
+def family_row_order() -> list[str]:
+    rows = []
+    for fam in MODEL_FAMILIES:
+        rows.append(format_model_for_table(fam, None))
+        for a in ALPHAS_ORDER:
+            rows.append(format_model_for_table(f"dir-{fam}", a))
+    return rows
+
+
+def format_mean_std(mean, std, scale=100.0):
+    if pd.isna(mean):
+        return "-"
+    if pd.isna(std):
+        return f"{mean * scale:.2f}"
+    return f"{mean * scale:.2f}$\\pm${std * scale:.2f}"
+
+
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
 
 # ---------------------------------------------------------------------
 # Config
@@ -76,33 +181,14 @@ def clean_metric_name(x: str) -> str:
     return x.replace("_", " ").title()
 
 
-def normalize_model_name(model: str) -> str:
-    model = model.strip().lower()
-    mapping = {
-        "dir-gcn": "dir-gcn",
-        "dir_gcn": "dir-gcn",
-        "dirgcn": "dir-gcn",
-        "gcn": "gcn",
-        "dir-gat": "dir-gat",
-        "dir_gat": "dir-gat",
-        "dirgat": "dir-gat",
-        "gat": "gat",
-        "dir-gcnii": "dir-gcnii",
-        "dir_gcnii": "dir-gcnii",
-        "dirgcnii": "dir-gcnii",
-        "gcnii": "gcnii",
-    }
-    return mapping.get(model, model.replace("_", "-"))
-
-
 def clean_model_name(x: str) -> str:
     mapping = {
         "gcn": "GCN",
         "dir-gcn": "DirGCN",
         "gat": "GAT",
         "dir-gat": "DirGAT",
-        "gcnii": "GCNII",
-        "dir-gcnii": "DirGCNII",
+        "sage": "SAGE",
+        "dir-sage": "DirSAGE",
     }
     return mapping.get(x.lower(), x)
 
@@ -216,6 +302,19 @@ def load_connectivity_metrics(metrics_dir: str | Path) -> pd.DataFrame:
 # Accuracy parsing
 # ---------------------------------------------------------------------
 
+def extract_alpha(model_name: str):
+    """
+    Extract alpha from strings like:
+    dir-gcn(alpha=0.5) or dir-gcn(a=0.5)
+    """
+    import re
+
+    m = re.search(r"(?:alpha|a)\s*=\s*([0-9.]+)", model_name)
+    if m:
+        return float(m.group(1))
+
+    return None
+
 def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> list[dict]:
     rows: list[dict] = []
 
@@ -225,11 +324,17 @@ def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> lis
             if not line:
                 continue
 
+            if "OOM" in line.upper():
+                continue
+
             m = ACC_RE_EXPLICIT.search(line)
             if m:
+                model_raw = m.group("model")
                 rows.append({
                     "dataset": m.group("dataset"),
-                    "model": normalize_model_name(m.group("model")),
+                    "model_raw": model_raw,
+                    "model": normalize_model_name(model_raw),
+                    "alpha": extract_alpha_from_text(model_raw),
                     "test_acc_mean": float(m.group("mean")),
                     "test_acc_std": float(m.group("std")),
                     "source_file": str(path),
@@ -239,9 +344,12 @@ def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> lis
 
             m = ACC_RE_EXPLICIT_FALLBACK.search(line)
             if m:
+                model_raw = m.group("model")
                 rows.append({
                     "dataset": m.group("dataset"),
-                    "model": normalize_model_name(m.group("model")),
+                    "model_raw": model_raw,
+                    "model": normalize_model_name(model_raw),
+                    "alpha": extract_alpha_from_text(model_raw),
                     "test_acc_mean": float(m.group("mean")),
                     "test_acc_std": np.nan,
                     "source_file": str(path),
@@ -251,9 +359,12 @@ def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> lis
 
             m = ACC_RE_COMPACT.search(line)
             if m and dataset_fallback is not None:
+                model_raw = m.group("model")
                 rows.append({
                     "dataset": dataset_fallback,
-                    "model": normalize_model_name(m.group("model")),
+                    "model_raw": model_raw,
+                    "model": normalize_model_name(model_raw),
+                    "alpha": extract_alpha_from_text(model_raw),
                     "test_acc_mean": float(m.group("mean")),
                     "test_acc_std": float(m.group("std")),
                     "source_file": str(path),
@@ -263,9 +374,12 @@ def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> lis
 
             m = ACC_RE_COMPACT_FALLBACK.search(line)
             if m and dataset_fallback is not None:
+                model_raw = m.group("model")
                 rows.append({
                     "dataset": dataset_fallback,
-                    "model": normalize_model_name(m.group("model")),
+                    "model_raw": model_raw,
+                    "model": normalize_model_name(model_raw),
+                    "alpha": extract_alpha_from_text(model_raw),
                     "test_acc_mean": float(m.group("mean")),
                     "test_acc_std": np.nan,
                     "source_file": str(path),
@@ -423,6 +537,8 @@ def compute_pooled_correlations(master_df: pd.DataFrame, out_dir: Path) -> pd.Da
             row.update(_corr_pair(x, y))
             rows.append(row)
 
+    master_df["delta_acc"] = master_df["delta_acc"].astype(float)
+    master_df["delta_acc"] *= 100.0
     y_all = master_df["delta_acc"].values.astype(float)
     for metric in CONNECTIVITY_METRICS:
         x_all = master_df[metric].values.astype(float)
@@ -694,7 +810,7 @@ def plot_scatter_all_models(master_df: pd.DataFrame, corr_df: pd.DataFrame, out_
 
         ax.set_title(title, fontsize=10)
         ax.set_xlabel(clean_metric_name(metric))
-        ax.set_ylabel("Δ Accuracy (Directed - Base)")
+        ax.set_ylabel("Δ Accuracy (Directed - Base) [%]")
 
         leg = ax.get_legend()
         if leg is not None:
@@ -933,6 +1049,291 @@ def build_summary_tables(master_df: pd.DataFrame, corr_df: pd.DataFrame, out_dir
         all_sub = all_sub.sort_values("spearman_r", key=lambda s: s.abs(), ascending=False)
         all_sub.to_csv(out_dir / "tables" / "all_models_ranked_metrics.csv", index=False)
 
+def prepare_accuracy_table_df(acc_df: pd.DataFrame) -> pd.DataFrame:
+    if acc_df.empty:
+        return acc_df.copy()
+
+    df = acc_df.copy()
+
+    # Keep best entry for each dataset/model/alpha combination
+    df = df.sort_values(
+        ["dataset", "model", "alpha", "test_acc_mean", "source_file"],
+        ascending=[True, True, True, False, True],
+    )
+    df = df.drop_duplicates(subset=["dataset", "model", "alpha"], keep="first").reset_index(drop=True)
+
+    df["family"] = df["model"].apply(base_family_from_model)
+    df["is_directed"] = df["model"].str.startswith("dir-")
+    df["model_display"] = df.apply(
+        lambda r: format_model_for_table(r["model"], r["alpha"]),
+        axis=1,
+    )
+    df["value_str"] = df.apply(
+        lambda r: format_mean_std(r["test_acc_mean"], r["test_acc_std"]),
+        axis=1,
+    )
+
+    return df
+
+
+def best_overall_per_dataset(acc_table_df: pd.DataFrame) -> dict[tuple[str, str], bool]:
+    """
+    Mark best row per dataset column across all rows.
+    Returns keys (model_display, dataset) -> bool
+    """
+    best_map = {}
+    if acc_table_df.empty:
+        return best_map
+
+    tmp = acc_table_df.copy()
+    for dataset, grp in tmp.groupby("dataset"):
+        grp = grp[grp["test_acc_mean"].notna()].copy()
+        if grp.empty:
+            continue
+        best_idx = grp["test_acc_mean"].idxmax()
+        row = grp.loc[best_idx]
+        best_map[(row["model_display"], dataset)] = True
+
+    return best_map
+
+
+def best_directed_alpha_per_family_dataset(acc_table_df: pd.DataFrame) -> dict[tuple[str, str], bool]:
+    """
+    Within each directed family block and dataset, mark best alpha.
+    Returns keys (model_display, dataset) -> bool
+    """
+    best_map = {}
+    if acc_table_df.empty:
+        return best_map
+
+    tmp = acc_table_df[acc_table_df["is_directed"]].copy()
+    if tmp.empty:
+        return best_map
+
+    for (family, dataset), grp in tmp.groupby(["family", "dataset"]):
+        grp = grp[grp["test_acc_mean"].notna()].copy()
+        if grp.empty:
+            continue
+        best_idx = grp["test_acc_mean"].idxmax()
+        row = grp.loc[best_idx]
+        best_map[(row["model_display"], dataset)] = True
+
+    return best_map
+
+
+def build_results_matrix(acc_df: pd.DataFrame, metrics_df: pd.DataFrame) -> tuple[pd.DataFrame, dict, dict]:
+    acc_table_df = prepare_accuracy_table_df(acc_df)
+
+    dataset_order = DATASET_GROUPS["homophilic"] + DATASET_GROUPS["heterophilic"]
+    row_order = family_row_order()
+
+    # Accuracy matrix
+    value_matrix = acc_table_df.pivot(index="model_display", columns="dataset", values="value_str")
+    value_matrix = value_matrix.reindex(index=row_order, columns=dataset_order)
+
+    # Homophily row
+    hom_row = pd.Series(index=dataset_order, dtype=object)
+    if not metrics_df.empty and "homophility" in metrics_df.columns:
+        metric_map = metrics_df.set_index("dataset")["homophility"].to_dict()
+        for ds in dataset_order:
+            val = metric_map.get(ds, np.nan)
+            hom_row[ds] = "-" if pd.isna(val) else f"{val:.3f}"
+
+    full_matrix = pd.concat(
+        [pd.DataFrame([hom_row], index=["HOM."]), value_matrix],
+        axis=0,
+    )
+
+    best_global = best_overall_per_dataset(acc_table_df)
+    best_alpha = best_directed_alpha_per_family_dataset(acc_table_df)
+
+    return full_matrix, best_global, best_alpha
+
+# def format_model_for_table(model: str, alpha: float | None):
+#     base = model.replace("dir-", "").upper()
+
+#     if "dir" in model:
+#         if alpha is None:
+#             return f"DIR-{base}"
+#         return f"DIR-{base}(α={alpha})"
+#     else:
+#         return base
+        
+def build_results_table(acc_df: pd.DataFrame, out_dir: Path):
+    safe_mkdir(out_dir / "tables")
+
+    # Keep best per dataset/model/alpha
+    acc_df = acc_df.sort_values("test_acc_mean", ascending=False)
+    acc_df["test_acc_mean"] = acc_df["test_acc_mean"].astype(float)
+    acc_df["test_acc_mean"] *= 100.0
+    acc_df["test_acc_std"] *= 100.0
+    acc_df = acc_df.drop_duplicates(
+        subset=["dataset", "model", "alpha"], keep="first"
+    )
+
+    # Format strings
+    acc_df["value"] = acc_df.apply(
+        lambda r: f"{r['test_acc_mean']:.2f}±{r['test_acc_std']:.2f}"
+        if pd.notna(r["test_acc_std"])
+        else f"{r['test_acc_mean']:.2f}",
+        axis=1,
+    )
+
+    acc_df["model_display"] = acc_df.apply(
+        lambda r: format_model_for_table(r["model"], r["alpha"]),
+        axis=1,
+    )
+
+    # Pivot
+    table = acc_df.pivot(
+        index="model_display",
+        columns="dataset",
+        values="value"
+    )
+
+    # Sort rows manually (important for paper)
+    order = [
+        "GCN",
+        "DIR-GCN(α=0.0)",
+        "DIR-GCN(α=1.0)",
+        "DIR-GCN(α=0.5)",
+        "SAGE",
+        "DIR-SAGE(α=0.0)",
+        "DIR-SAGE(α=1.0)",
+        "DIR-SAGE(α=0.5)",
+        "GAT",
+        "DIR-GAT(α=0.0)",
+        "DIR-GAT(α=1.0)",
+        "DIR-GAT(α=0.5)",
+    ]
+
+    table = table.reindex(order)
+
+    table.to_csv(out_dir / "tables" / "results_table.csv")
+
+    return table
+
+def latex_escape_dataset_name(name: str) -> str:
+    return dataset_display_name(name)
+
+
+def style_cell_latex(text: str, bold: bool = False, underline: bool = False) -> str:
+    if text is None or text == "" or (isinstance(text, float) and pd.isna(text)):
+        return "-"
+    out = str(text)
+    if underline:
+        out = f"\\underline{{{out}}}"
+    if bold:
+        out = f"\\textbf{{{out}}}"
+    return out
+
+
+def export_results_table_latex(
+    matrix: pd.DataFrame,
+    out_path: Path,
+    best_global: dict,
+    best_alpha: dict,
+):
+    dataset_order = DATASET_GROUPS["homophilic"] + DATASET_GROUPS["heterophilic"]
+    hom_datasets = DATASET_GROUPS["homophilic"]
+    het_datasets = DATASET_GROUPS["heterophilic"]
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\\begin{tabular}{l" + "c" * len(dataset_order) + "}\n")
+        f.write("\\toprule\n")
+
+        # Group headers
+        f.write(
+            " & "
+            + f"\\multicolumn{{{len(hom_datasets)}}}{{c}}{{Homophilic}}"
+            + " & "
+            + f"\\multicolumn{{{len(het_datasets)}}}{{c}}{{Heterophilic}}"
+            + " \\\\\n"
+        )
+
+        # cmidrules
+        left_start = 2
+        left_end = 1 + len(hom_datasets)
+        right_start = left_end + 1
+        right_end = left_end + len(het_datasets)
+        f.write(f"\\cmidrule(lr){{{left_start}-{left_end}}}\\cmidrule(lr){{{right_start}-{right_end}}}\n")
+
+        # Dataset names
+        header = " & ".join(latex_escape_dataset_name(ds) for ds in dataset_order)
+        f.write(f" & {header} \\\\\n")
+        f.write("\\midrule\n")
+
+        # Homophily row
+        hom_vals = [matrix.loc["HOM.", ds] if ds in matrix.columns else "-" for ds in dataset_order]
+        f.write("HOM. & " + " & ".join(hom_vals) + " \\\\\n")
+        f.write("\\midrule\n")
+
+        # Accuracy blocks
+        for fam in MODEL_FAMILIES:
+            base_row = format_model_for_table(fam, None)
+            dir_rows = [format_model_for_table(f"dir-{fam}", a) for a in ALPHAS_ORDER]
+
+            block_rows = [base_row] + dir_rows
+
+            for ridx, row_name in enumerate(block_rows):
+                vals = []
+                for ds in dataset_order:
+                    val = matrix.loc[row_name, ds] if (row_name in matrix.index and ds in matrix.columns) else "-"
+
+                    is_best_global = (row_name, ds) in best_global
+                    is_best_alpha = (row_name, ds) in best_alpha
+
+                    vals.append(
+                        style_cell_latex(
+                            val,
+                            bold=is_best_global or is_best_alpha,
+                            underline=is_best_alpha,
+                        )
+                    )
+
+                label = row_name.replace("$\\alpha$", r"\alpha")
+                f.write(f"{label} & " + " & ".join(vals) + " \\\\\n")
+
+            if fam != MODEL_FAMILIES[-1]:
+                f.write("\\midrule\n")
+
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+
+def export_results_table_csv(matrix: pd.DataFrame, out_path: Path):
+    matrix.to_csv(out_path, index=True)
+
+def build_publication_results_table(acc_df: pd.DataFrame, metrics_df: pd.DataFrame, out_dir: Path):
+    table_dir = safe_mkdir(out_dir / "tables")
+
+    matrix, best_global, best_alpha = build_results_matrix(acc_df, metrics_df)
+
+    export_results_table_csv(matrix, table_dir / "results_table_full.csv")
+    export_results_table_latex(
+        matrix,
+        table_dir / "results_table_full.tex",
+        best_global=best_global,
+        best_alpha=best_alpha,
+    )
+
+    return matrix
+    
+def export_latex_table(table: pd.DataFrame, out_path: Path):
+    with open(out_path, "w") as f:
+        f.write("\\begin{tabular}{l" + "c" * len(table.columns) + "}\n")
+        f.write("\\toprule\n")
+
+        # Header
+        cols = " & ".join([c.upper().replace("_", "-") for c in table.columns])
+        f.write(f" & {cols} \\\\\n")
+        f.write("\\midrule\n")
+
+        for idx, row in table.iterrows():
+            values = " & ".join(row.fillna("-"))
+            f.write(f"{idx} & {values} \\\\\n")
+
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
 
 # ---------------------------------------------------------------------
 # Main
@@ -1014,6 +1415,9 @@ def main():
     plot_connectivity_heatmap(metrics_df, out_dir)
     plot_connectivity_scatter(metrics_df, out_dir, annotate=annotate)
 
+    results_table = build_results_table(acc_df, out_dir)
+    export_latex_table(results_table, out_dir / "tables" / "results_table.tex")
+    build_publication_results_table(acc_df, metrics_df, out_dir)
     log.info(f"Done. Outputs saved to: {out_dir}")
 
 
