@@ -5,8 +5,8 @@ import argparse
 import gc
 import json
 import logging
+import math
 import os
-import sys
 from collections import Counter
 from typing import Any
 
@@ -30,10 +30,13 @@ try:
 except Exception:  # pragma: no cover
     sparse = None
 
+
+log = logging.getLogger("connectivity")
+
+# Adapted and extended from the attached connectivity.py. :contentReference[oaicite:0]{index=0}
+
+
 def get_data_from_loader(dataset, batch_size: int = 1):
-    """
-    Same loader logic as your snippet.
-    """
     data = dataset._data
     data_loader = DataLoader(
         FullBatchGraphDataset(data),
@@ -42,10 +45,10 @@ def get_data_from_loader(dataset, batch_size: int = 1):
     )
     return next(iter(data_loader))
 
+
 # ----------------------------- Utility helpers ----------------------------- #
 
 def gini_coefficient(x: np.ndarray) -> float:
-    """Linear-memory Gini coefficient for a non-negative array."""
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return float("nan")
@@ -60,7 +63,6 @@ def gini_coefficient(x: np.ndarray) -> float:
     return float((2.0 * np.dot(idx, x) / denom) - ((n + 1.0) / n))
 
 
-
 def ensure_undirected(G: nx.Graph | nx.DiGraph, make_copy: bool = True) -> nx.Graph:
     if G.is_directed():
         UG = nx.Graph()
@@ -70,7 +72,6 @@ def ensure_undirected(G: nx.Graph | nx.DiGraph, make_copy: bool = True) -> nx.Gr
     return G.copy() if make_copy else G  # type: ignore[return-value]
 
 
-
 def get_edge_index_numpy(data: PyGData) -> np.ndarray:
     edge_index = data["edge_index"]
     if edge_index is None:
@@ -78,7 +79,6 @@ def get_edge_index_numpy(data: PyGData) -> np.ndarray:
     if torch is None:
         raise RuntimeError("torch is required to process PyG edge_index")
     return edge_index.detach().cpu().numpy().astype(np.int64, copy=False)
-
 
 
 def get_num_nodes(data: PyGData) -> int:
@@ -93,7 +93,6 @@ def get_num_nodes(data: PyGData) -> int:
     return int(edge_index.max().item()) + 1
 
 
-
 def pyg_to_nx_minimal(data: PyGData, undirected: bool) -> nx.Graph | nx.DiGraph:
     ei = get_edge_index_numpy(data)
     n = get_num_nodes(data)
@@ -102,35 +101,6 @@ def pyg_to_nx_minimal(data: PyGData, undirected: bool) -> nx.Graph | nx.DiGraph:
     if ei.shape[1] > 0:
         G.add_edges_from(zip(ei[0], ei[1]))
     return G
-
-
-
-def bidirectionality_gap(data: PyGData) -> float:
-    """Percentage of non-self-loop edges whose reverse edge is missing."""
-    ei = get_edge_index_numpy(data)
-    if ei.shape[1] == 0:
-        return float("nan")
-
-    src = ei[0]
-    dst = ei[1]
-    mask = src != dst
-    src = src[mask]
-    dst = dst[mask]
-    if src.size == 0:
-        return float("nan")
-
-    if src.size == 0:
-        return float("nan")
-
-    n_base = int(max(src.max(initial=0), dst.max(initial=0))) + 1
-    keys = src * n_base + dst
-    rev_keys = dst * n_base + src
-    unique_keys = np.unique(keys)
-    unique_rev = np.unique(rev_keys)
-    key_set = set(unique_keys.tolist())
-    missing = sum(1 for key in unique_rev.tolist() if key not in key_set)
-    return 100.0 * missing / unique_keys.size if unique_keys.size > 0 else float("nan")
-
 
 
 def largest_connected_component(G: nx.Graph | nx.DiGraph) -> nx.Graph:
@@ -144,7 +114,6 @@ def largest_connected_component(G: nx.Graph | nx.DiGraph) -> nx.Graph:
     return UG.subgraph(lcc_nodes).copy()
 
 
-
 def safe_density(G: nx.Graph) -> float:
     n = G.number_of_nodes()
     if n <= 1:
@@ -153,9 +122,7 @@ def safe_density(G: nx.Graph) -> float:
     return (2.0 * m) / (n * (n - 1))
 
 
-
 def cheeger_constant(G: nx.Graph) -> float:
-    """Approximate Cheeger constant via random cuts to keep memory bounded."""
     n = G.number_of_nodes()
     if n <= 1:
         return float("nan")
@@ -176,7 +143,432 @@ def cheeger_constant(G: nx.Graph) -> float:
     return float(best) if np.isfinite(best) else float("nan")
 
 
-# ----------------------------- Metric routines ----------------------------- #
+def _extract_labels_numpy(data: PyGData) -> np.ndarray | None:
+    y = data.get("y", None)
+    if y is None or torch is None:
+        return None
+
+    y = y.detach().cpu()
+    if y.ndim == 1:
+        return y.numpy().astype(np.int64, copy=False)
+
+    # For multi-dimensional labels, compress rows to categorical ids.
+    y_np = y.numpy()
+    _, inv = np.unique(y_np, axis=0, return_inverse=True)
+    return inv.astype(np.int64, copy=False)
+
+
+def _safe_entropy_from_counts(counts: np.ndarray) -> float:
+    s = counts.sum()
+    if s <= 0:
+        return 0.0
+    p = counts[counts > 0] / s
+    return float(-(p * np.log(p)).sum())
+
+
+def _js_divergence_from_count_vectors(c1: np.ndarray, c2: np.ndarray) -> float:
+    s1 = c1.sum()
+    s2 = c2.sum()
+    if s1 <= 0 and s2 <= 0:
+        return float("nan")
+    if s1 <= 0 or s2 <= 0:
+        return float("nan")
+    p = c1 / s1
+    q = c2 / s2
+    m = 0.5 * (p + q)
+
+    mask_p = p > 0
+    mask_q = q > 0
+    kl_pm = np.sum(p[mask_p] * np.log(p[mask_p] / m[mask_p]))
+    kl_qm = np.sum(q[mask_q] * np.log(q[mask_q] / m[mask_q]))
+    return float(0.5 * (kl_pm + kl_qm))
+
+
+# ----------------------------- Directed metrics ----------------------------- #
+
+def reverse_edge_ratio_metrics(data: PyGData) -> dict[str, float]:
+    """
+    Edge-level asymmetry metrics.
+    Computed on unique non-self-loop directed edges only.
+    """
+    ei = get_edge_index_numpy(data)
+    if ei.shape[1] == 0:
+        return {
+            "reverse_edge_ratio": float("nan"),
+            "missing_reverse_edges": float("nan"),
+            "unique_directed_edges_no_self_loops": 0.0,
+            "reciprocity_ratio": float("nan"),
+            "bidirectionality_gap": float("nan"),
+        }
+
+    src = ei[0]
+    dst = ei[1]
+    mask = src != dst
+    src = src[mask]
+    dst = dst[mask]
+    if src.size == 0:
+        return {
+            "reverse_edge_ratio": float("nan"),
+            "missing_reverse_edges": float("nan"),
+            "unique_directed_edges_no_self_loops": 0.0,
+            "reciprocity_ratio": float("nan"),
+            "bidirectionality_gap": float("nan"),
+        }
+
+    n_base = int(max(src.max(initial=0), dst.max(initial=0))) + 1
+    keys = src * n_base + dst
+    rev_keys = dst * n_base + src
+
+    unique_keys = np.unique(keys)
+    unique_rev = np.unique(rev_keys)
+    key_set = set(unique_keys.tolist())
+
+    missing = sum(1 for rk in unique_rev.tolist() if rk not in key_set)
+    total = unique_keys.size
+    reverse_ratio = float(missing / total) if total > 0 else float("nan")
+    reciprocity = float(1.0 - reverse_ratio) if total > 0 else float("nan")
+
+    return {
+        "reverse_edge_ratio": 100.0 * reverse_ratio if total > 0 else float("nan"),
+        "missing_reverse_edges": float(missing),
+        "unique_directed_edges_no_self_loops": float(total),
+        "reciprocity_ratio": 100.0 * reciprocity if total > 0 else float("nan"),
+        "bidirectionality_gap": 100.0 * reverse_ratio if total > 0 else float("nan"),
+    }
+
+
+def directional_node_role_metrics(data: PyGData) -> dict[str, float]:
+    """
+    Directional imbalance per node:
+      b_i = |out_i - in_i| / (out_i + in_i + eps)
+
+    User requested mean, min, max.
+    Also includes fractions of near-sources and near-sinks.
+    """
+    ei = get_edge_index_numpy(data)
+    n = get_num_nodes(data)
+
+    out = {
+        "in_degree_mean": float("nan"),
+        "out_degree_mean": float("nan"),
+        "directional_imbalance_mean": float("nan"),
+        "directional_imbalance_min": float("nan"),
+        "directional_imbalance_max": float("nan"),
+        "fraction_near_sources": float("nan"),
+        "fraction_near_sinks": float("nan"),
+        "fraction_pure_sources": float("nan"),
+        "fraction_pure_sinks": float("nan"),
+    }
+    if n == 0:
+        return out
+
+    if ei.shape[1] == 0:
+        zeros = np.zeros(n, dtype=np.float64)
+        out.update({
+            "in_degree_mean": 0.0,
+            "out_degree_mean": 0.0,
+            "directional_imbalance_mean": 0.0,
+            "directional_imbalance_min": 0.0,
+            "directional_imbalance_max": 0.0,
+            "fraction_near_sources": 0.0,
+            "fraction_near_sinks": 0.0,
+            "fraction_pure_sources": 0.0,
+            "fraction_pure_sinks": 0.0,
+        })
+        return out
+
+    src = ei[0]
+    dst = ei[1]
+
+    out_deg = np.bincount(src, minlength=n).astype(np.float64, copy=False)
+    in_deg = np.bincount(dst, minlength=n).astype(np.float64, copy=False)
+
+    denom = in_deg + out_deg
+    imbalance = np.zeros(n, dtype=np.float64)
+    nz = denom > 0
+    imbalance[nz] = np.abs(out_deg[nz] - in_deg[nz]) / denom[nz]
+
+    # "Near" thresholds: at least 90% of incident edges concentrated in one direction.
+    # Equivalent to imbalance >= 0.9, plus presence of at least one incident edge.
+    near_source = nz & (out_deg > in_deg) & (imbalance >= 0.9)
+    near_sink = nz & (in_deg > out_deg) & (imbalance >= 0.9)
+
+    pure_source = (out_deg > 0) & (in_deg == 0)
+    pure_sink = (in_deg > 0) & (out_deg == 0)
+
+    out.update({
+        "in_degree_mean": float(in_deg.mean()),
+        "out_degree_mean": float(out_deg.mean()),
+        "directional_imbalance_mean": float(imbalance.mean()),
+        "directional_imbalance_min": float(imbalance.min()),
+        "directional_imbalance_max": float(imbalance.max()),
+        "fraction_near_sources": float(near_source.mean() * 100.0),
+        "fraction_near_sinks": float(near_sink.mean() * 100.0),
+        "fraction_pure_sources": float(pure_source.mean() * 100.0),
+        "fraction_pure_sinks": float(pure_sink.mean() * 100.0),
+    })
+    return out
+
+
+def scc_fragmentation_metrics(G: nx.Graph | nx.DiGraph) -> dict[str, float]:
+    """
+    Global one-way organization metrics.
+    """
+    out = {
+        "n_strongly_connected_components": float("nan"),
+        "largest_scc_size": float("nan"),
+        "largest_scc_fraction": float("nan"),
+        "n_weakly_connected_components": float("nan"),
+        "largest_wcc_size": float("nan"),
+        "largest_wcc_fraction": float("nan"),
+        "fraction_edges_between_sccs": float("nan"),
+        "condensation_n_nodes": float("nan"),
+        "condensation_n_edges": float("nan"),
+        "condensation_density": float("nan"),
+    }
+
+    if G.number_of_nodes() == 0:
+        return out
+
+    if not G.is_directed():
+        # For undirected graphs SCC/WCC coincide with CCs.
+        comps = list(nx.connected_components(G))
+        sizes = np.array([len(c) for c in comps], dtype=np.float64) if comps else np.array([], dtype=np.float64)
+        n = G.number_of_nodes()
+        largest = float(sizes.max()) if sizes.size else 0.0
+        frac = float(100.0 * largest / n) if n > 0 else float("nan")
+        return {
+            "n_strongly_connected_components": float(len(comps)),
+            "largest_scc_size": largest,
+            "largest_scc_fraction": frac,
+            "n_weakly_connected_components": float(len(comps)),
+            "largest_wcc_size": largest,
+            "largest_wcc_fraction": frac,
+            "fraction_edges_between_sccs": 0.0,
+            "condensation_n_nodes": float(len(comps)),
+            "condensation_n_edges": 0.0,
+            "condensation_density": 0.0,
+        }
+
+    n = G.number_of_nodes()
+
+    sccs = list(nx.strongly_connected_components(G))
+    scc_sizes = np.array([len(c) for c in sccs], dtype=np.float64) if sccs else np.array([], dtype=np.float64)
+    largest_scc = float(scc_sizes.max()) if scc_sizes.size else 0.0
+
+    wccs = list(nx.weakly_connected_components(G))
+    wcc_sizes = np.array([len(c) for c in wccs], dtype=np.float64) if wccs else np.array([], dtype=np.float64)
+    largest_wcc = float(wcc_sizes.max()) if wcc_sizes.size else 0.0
+
+    scc_index: dict[int, int] = {}
+    for idx, comp in enumerate(sccs):
+        for u in comp:
+            scc_index[int(u)] = idx
+
+    inter_scc_edges = 0
+    for u, v in G.edges():
+        if scc_index.get(int(u), -1) != scc_index.get(int(v), -1):
+            inter_scc_edges += 1
+
+    try:
+        C = nx.condensation(G, scc=sccs)
+        c_nodes = C.number_of_nodes()
+        c_edges = C.number_of_edges()
+        c_density = float(nx.density(C)) if c_nodes > 1 else 0.0
+    except Exception:
+        c_nodes = len(sccs)
+        c_edges = float("nan")
+        c_density = float("nan")
+
+    return {
+        "n_strongly_connected_components": float(len(sccs)),
+        "largest_scc_size": largest_scc,
+        "largest_scc_fraction": float(100.0 * largest_scc / n) if n > 0 else float("nan"),
+        "n_weakly_connected_components": float(len(wccs)),
+        "largest_wcc_size": largest_wcc,
+        "largest_wcc_fraction": float(100.0 * largest_wcc / n) if n > 0 else float("nan"),
+        "fraction_edges_between_sccs": float(100.0 * inter_scc_edges / max(1, G.number_of_edges())),
+        "condensation_n_nodes": float(c_nodes),
+        "condensation_n_edges": float(c_edges),
+        "condensation_density": c_density,
+    }
+
+
+def reachability_asymmetry_metrics(
+    G: nx.Graph | nx.DiGraph,
+    max_sources: int = 128,
+    random_state: int = 27,
+) -> dict[str, float]:
+    """
+    Approximate reachability asymmetry using sampled BFS/DFS sources.
+    Memory-wise: no all-pairs matrix, only per-source reachability sets.
+    """
+    out = {
+        "reachability_asymmetry": float("nan"),
+        "reachable_pairs_sampled": float("nan"),
+        "asymmetric_reachable_pairs_sampled": float("nan"),
+    }
+
+    if G.number_of_nodes() == 0:
+        return out
+
+    if not G.is_directed():
+        return {
+            "reachability_asymmetry": 0.0,
+            "reachable_pairs_sampled": 0.0,
+            "asymmetric_reachable_pairs_sampled": 0.0,
+        }
+
+    nodes = np.fromiter(G.nodes(), dtype=np.int64, count=G.number_of_nodes())
+    if nodes.size == 0:
+        return out
+
+    rng = np.random.default_rng(random_state)
+    sources = rng.choice(nodes, size=min(max_sources, nodes.size), replace=False)
+
+    reach_sets: dict[int, set[int]] = {}
+    for s in sources.tolist():
+        # descendants excludes the source itself
+        reach_sets[int(s)] = nx.descendants(G, int(s))
+
+    asym = 0
+    total_reachable = 0
+    source_list = list(reach_sets.keys())
+
+    for u in source_list:
+        Ru = reach_sets[u]
+        for v in source_list:
+            if u == v:
+                continue
+            uv = v in Ru
+            vu = u in reach_sets[v]
+            if uv or vu:
+                total_reachable += 1
+                if uv != vu:
+                    asym += 1
+
+    out["reachable_pairs_sampled"] = float(total_reachable)
+    out["asymmetric_reachable_pairs_sampled"] = float(asym)
+    out["reachability_asymmetry"] = float(100.0 * asym / total_reachable) if total_reachable > 0 else float("nan")
+    return out
+
+
+def label_flow_asymmetry_metrics(data: PyGData) -> dict[str, float]:
+    """
+    Memory-efficient directed label-flow asymmetry.
+
+    T[a, b] = number of edges from class a to class b
+    Measure asymmetry via ||T - T^T||_1 / ||T||_1
+
+    Implemented without dense N x N structures; only K x K label-flow matrix,
+    where K is number of classes/label patterns.
+    """
+    out = {
+        "label_flow_asymmetry": float("nan"),
+        "label_flow_n_classes": float("nan"),
+    }
+
+    y = _extract_labels_numpy(data)
+    if y is None:
+        return out
+
+    ei = get_edge_index_numpy(data)
+    if ei.shape[1] == 0:
+        return out
+
+    src = ei[0]
+    dst = ei[1]
+    if src.size == 0:
+        return out
+
+    classes, y_compact = np.unique(y, return_inverse=True)
+    k = classes.size
+    out["label_flow_n_classes"] = float(k)
+    if k <= 1:
+        out["label_flow_asymmetry"] = 0.0
+        return out
+
+    cs = y_compact[src]
+    cd = y_compact[dst]
+
+    T = np.zeros((k, k), dtype=np.int64)
+    np.add.at(T, (cs, cd), 1)
+
+    num = np.abs(T - T.T).sum()
+    den = T.sum()
+    out["label_flow_asymmetry"] = float(100.0 * num / den) if den > 0 else float("nan")
+    return out
+
+
+def in_out_label_jsd_metrics(data: PyGData) -> dict[str, float]:
+    """
+    For each node i, compare label distributions of predecessors vs successors
+    with Jensen-Shannon divergence.
+
+    Implemented in a sparse streaming style:
+    - compress labels to 0..K-1
+    - accumulate per-node incoming/outgoing class counts with np.add.at
+    - compute JSD node-wise
+    """
+    out = {
+        "in_out_label_jsd_mean": float("nan"),
+        "in_out_label_jsd_max": float("nan"),
+        "in_out_label_jsd_valid_nodes": float("nan"),
+    }
+
+    y = _extract_labels_numpy(data)
+    if y is None:
+        return out
+
+    ei = get_edge_index_numpy(data)
+    n = get_num_nodes(data)
+    if n == 0 or ei.shape[1] == 0:
+        return out
+
+    classes, y_compact = np.unique(y, return_inverse=True)
+    k = classes.size
+    if k <= 1:
+        return {
+            "in_out_label_jsd_mean": 0.0,
+            "in_out_label_jsd_max": 0.0,
+            "in_out_label_jsd_valid_nodes": 0.0,
+        }
+
+    src = ei[0]
+    dst = ei[1]
+
+    out_cls = y_compact[dst]  # successor labels for source nodes
+    in_cls = y_compact[src]   # predecessor labels for destination nodes
+
+    out_counts = np.zeros((n, k), dtype=np.int32)
+    in_counts = np.zeros((n, k), dtype=np.int32)
+
+    np.add.at(out_counts, (src, out_cls), 1)
+    np.add.at(in_counts, (dst, in_cls), 1)
+
+    js_vals = []
+    out_deg = out_counts.sum(axis=1)
+    in_deg = in_counts.sum(axis=1)
+    valid = (out_deg > 0) & (in_deg > 0)
+
+    valid_idx = np.flatnonzero(valid)
+    for i in valid_idx.tolist():
+        js = _js_divergence_from_count_vectors(in_counts[i], out_counts[i])
+        if np.isfinite(js):
+            js_vals.append(js)
+
+    if len(js_vals) == 0:
+        return out
+
+    js_arr = np.asarray(js_vals, dtype=np.float64)
+    return {
+        "in_out_label_jsd_mean": float(js_arr.mean()),
+        "in_out_label_jsd_max": float(js_arr.max()),
+        "in_out_label_jsd_valid_nodes": float(js_arr.size),
+    }
+
+
+# ----------------------------- Existing metrics ----------------------------- #
 
 def degree_stats(G: nx.Graph) -> dict[str, float]:
     deg = np.fromiter((d for _, d in G.degree()), dtype=np.float64)
@@ -203,7 +595,6 @@ def degree_stats(G: nx.Graph) -> dict[str, float]:
     }
 
 
-
 def triangle_and_clustering(G: nx.Graph) -> dict[str, float]:
     if G.number_of_nodes() == 0:
         return {
@@ -225,7 +616,6 @@ def triangle_and_clustering(G: nx.Graph) -> dict[str, float]:
     }
 
 
-
 def degree_assortativity(G: nx.Graph) -> float:
     if G.number_of_edges() == 0:
         return float("nan")
@@ -233,7 +623,6 @@ def degree_assortativity(G: nx.Graph) -> float:
         return float(nx.degree_assortativity_coefficient(G))
     except Exception:
         return float("nan")
-
 
 
 def distances_and_effective_diameter(
@@ -294,7 +683,6 @@ def distances_and_effective_diameter(
     return out
 
 
-
 def connectivity_measures(G: nx.Graph, heavy_skip: bool, max_n_for_exact: int) -> dict[str, float]:
     n = G.number_of_nodes()
     if n == 0:
@@ -320,7 +708,6 @@ def connectivity_measures(G: nx.Graph, heavy_skip: bool, max_n_for_exact: int) -
         pass
     out["cheeger_constant_LCC"] = cheeger_constant(G)
     return out
-
 
 
 def spectral_measures(G: nx.Graph, heavy_skip: bool, max_n_for_exact: int) -> dict[str, float]:
@@ -387,7 +774,6 @@ def spectral_measures(G: nx.Graph, heavy_skip: bool, max_n_for_exact: int) -> di
     }
 
 
-
 def homophility(data: PyGData) -> dict[str, float]:
     y = data.get("y", None)
     edge_index = data.get("edge_index", None)
@@ -412,9 +798,7 @@ def homophility(data: PyGData) -> dict[str, float]:
     return {"homophility": float(per_node.mean().item())}
 
 
-
 def save_edge_homophily_sparse(data: PyGData, path: str) -> None:
-    """Save only edge-supported homophily information, never a dense N x N matrix."""
     y = data.get("y", None)
     edge_index = data.get("edge_index", None)
     if y is None or edge_index is None or edge_index.size(1) == 0:
@@ -448,7 +832,8 @@ def compute_metrics_for_graph(
     sampled_bfs_sources: int,
     heavy_skip: bool,
     max_n_for_exact: int,
-    compute_missing_reverse_metric: bool = False,
+    compute_directed_metrics: bool = False,
+    reachability_sources: int = 128,
 ) -> dict[str, str | float | int]:
     Gu = ensure_undirected(G) if undirected_analysis else G
 
@@ -456,15 +841,14 @@ def compute_metrics_for_graph(
         "dataset": name,
         "n_nodes": int(Gu.number_of_nodes()),
         "n_edges": int(Gu.number_of_edges()),
-        "density": float(safe_density(Gu)),
-        "bidirectionality_gap": bidirectionality_gap(data) if compute_missing_reverse_metric else float("nan"),
+        "density": float(safe_density(ensure_undirected(Gu))),
     }
 
-    metrics.update(degree_stats(Gu))
-    metrics["assortativity_degree"] = degree_assortativity(Gu)
-    metrics.update(triangle_and_clustering(Gu))
+    metrics.update(degree_stats(ensure_undirected(Gu)))
+    metrics["assortativity_degree"] = degree_assortativity(ensure_undirected(Gu))
+    metrics.update(triangle_and_clustering(ensure_undirected(Gu)))
 
-    LCC = largest_connected_component(Gu)
+    LCC = largest_connected_component(ensure_undirected(Gu))
     metrics.update(
         distances_and_effective_diameter(
             LCC,
@@ -475,8 +859,61 @@ def compute_metrics_for_graph(
     metrics.update(connectivity_measures(LCC, heavy_skip=heavy_skip, max_n_for_exact=max_n_for_exact))
     metrics.update(spectral_measures(LCC, heavy_skip=heavy_skip, max_n_for_exact=max_n_for_exact))
     metrics.update(homophility(data))
-    return metrics
 
+    # Directed explanatory metrics: Tier 1 + best Tier 2 choices
+    # Tier 1:
+    # - reverse-edge ratio
+    # - directional node-role imbalance
+    # - SCC fragmentation
+    # - reachability asymmetry
+    # Tier 2:
+    # - label-flow asymmetry
+    # - in/out neighborhood label JSD
+    if compute_directed_metrics:
+        metrics.update(reverse_edge_ratio_metrics(data))
+        metrics.update(directional_node_role_metrics(data))
+        metrics.update(scc_fragmentation_metrics(G))
+        metrics.update(reachability_asymmetry_metrics(G, max_sources=reachability_sources))
+        metrics.update(label_flow_asymmetry_metrics(data))
+        metrics.update(in_out_label_jsd_metrics(data))
+    else:
+        nan_directed = {
+            "reverse_edge_ratio": float("nan"),
+            "missing_reverse_edges": float("nan"),
+            "unique_directed_edges_no_self_loops": float("nan"),
+            "reciprocity_ratio": float("nan"),
+            "bidirectionality_gap": float("nan"),
+            "in_degree_mean": float("nan"),
+            "out_degree_mean": float("nan"),
+            "directional_imbalance_mean": float("nan"),
+            "directional_imbalance_min": float("nan"),
+            "directional_imbalance_max": float("nan"),
+            "fraction_near_sources": float("nan"),
+            "fraction_near_sinks": float("nan"),
+            "fraction_pure_sources": float("nan"),
+            "fraction_pure_sinks": float("nan"),
+            "n_strongly_connected_components": float("nan"),
+            "largest_scc_size": float("nan"),
+            "largest_scc_fraction": float("nan"),
+            "n_weakly_connected_components": float("nan"),
+            "largest_wcc_size": float("nan"),
+            "largest_wcc_fraction": float("nan"),
+            "fraction_edges_between_sccs": float("nan"),
+            "condensation_n_nodes": float("nan"),
+            "condensation_n_edges": float("nan"),
+            "condensation_density": float("nan"),
+            "reachability_asymmetry": float("nan"),
+            "reachable_pairs_sampled": float("nan"),
+            "asymmetric_reachable_pairs_sampled": float("nan"),
+            "label_flow_asymmetry": float("nan"),
+            "label_flow_n_classes": float("nan"),
+            "in_out_label_jsd_mean": float("nan"),
+            "in_out_label_jsd_max": float("nan"),
+            "in_out_label_jsd_valid_nodes": float("nan"),
+        }
+        metrics.update(nan_directed)
+
+    return metrics
 
 
 def save_metrics(metrics: dict[str, str | float | int], out_dir: str, stem: str) -> str:
@@ -490,10 +927,11 @@ def save_metrics(metrics: dict[str, str | float | int], out_dir: str, stem: str)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Compute graph metrics and save compact outputs")
+    p = argparse.ArgumentParser(description="Compute graph connectivity and direction-aware metrics")
     p.add_argument("-d", "--dataset", type=str, required=True)
     p.add_argument("-u", "--undirected", action="store_true", help="Treat input as undirected")
     p.add_argument("--sampled-bfs-sources", type=int, default=300)
+    p.add_argument("--reachability-sources", type=int, default=128)
     p.add_argument("--dataset-directory", type=str, default="dataset")
     p.add_argument("--self-loops", action="store_true")
     p.add_argument("--transpose", action="store_true")
@@ -504,13 +942,13 @@ def main() -> None:
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    print("Arguments:", args)
 
     dataset_name = args.dataset
     directionality = "undirected" if args.undirected else "directed"
     outdir = os.path.join(args.outdir, dataset_name)
     os.makedirs(outdir, exist_ok=True)
 
-    # ---------------- Baseline: same loading logic as training code ----------------
     dataset, evaluator = get_dataset(
         name=args.dataset,
         root_dir=args.dataset_directory,
@@ -520,7 +958,8 @@ def main() -> None:
     )
     data = get_data_from_loader(dataset)
     G = pyg_to_nx_minimal(data, undirected=args.undirected)
-    baseline_metrics = compute_metrics_for_graph(
+
+    metrics = compute_metrics_for_graph(
         dataset_name,
         G,
         data,
@@ -529,13 +968,19 @@ def main() -> None:
         sampled_bfs_sources=args.sampled_bfs_sources,
         heavy_skip=args.heavy_skip,
         max_n_for_exact=args.max_n_for_exact,
-        compute_missing_reverse_metric=not args.undirected,
+        compute_directed_metrics=not args.undirected,
+        reachability_sources=args.reachability_sources,
     )
-    baseline_csv = save_metrics(baseline_metrics, outdir, directionality)
-    logging.info("Saved baseline metrics to %s", baseline_csv)
+    csv_path = save_metrics(metrics, outdir, directionality)
+    logging.info("Saved metrics to %s", csv_path)
 
-    # edge_h_path = os.path.join(args.outdir, dataset_name, f"{directionality}.npz")
+    # Optional sparse edge-homophily dump
+    # edge_h_path = os.path.join(outdir, f"{directionality}.npz")
     # save_edge_homophily_sparse(data, edge_h_path)
+
+    del data
+    del G
+    gc.collect()
 
 
 if __name__ == "__main__":
