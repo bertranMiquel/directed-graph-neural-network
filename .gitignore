@@ -10,6 +10,13 @@ scalability.iml
 .idea/
 .DS_Store
 
+results/
+logs/
+datasets/
+dataset/
+runfiles/
+wandb/
+*.sh
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
