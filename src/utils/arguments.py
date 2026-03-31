@@ -20,7 +20,7 @@ parser.add_argument("--num_layers", type=int, help="Number of GNN layers", defau
 parser.add_argument("--dropout", type=float, help="Feature dropout", default=0.0)
 parser.add_argument("--alpha", type=float, help="Direction convex combination params", default=0.5)
 parser.add_argument("--learn_alpha", action="store_true")
-parser.add_argument("--conv_type", type=str, help="DirGNN Model", default="dir-gcn")
+parser.add_argument("--conv_type", type=str, help="DirGNN Model", default="dir-gcn", choices=["gcn", "gat", "sage", "dir-gcn", "dir-gat", "dir-sage"])
 parser.add_argument("--normalize", action="store_true")
 parser.add_argument("--jk", type=str, choices=["max", "cat", None], default="max")
 
@@ -28,8 +28,8 @@ parser.add_argument("--jk", type=str, choices=["max", "cat", None], default="max
 parser.add_argument("--lr", type=float, help="Learning Rate", default=0.001)
 parser.add_argument("--weight_decay", type=float, help="Weight decay", default=0.0)
 parser.add_argument("--num_epochs", type=int, help="Max number of epochs", default=10000)
-parser.add_argument("--patience", type=int, help="Patience for early stopping", default=10)
-parser.add_argument("--num_runs", type=int, help="Max number of runs", default=1)
+parser.add_argument("--patience", type=int, help="Patience for early stopping", default=100)
+parser.add_argument("--num_runs", type=int, help="Max number of runs", default=5)
 
 ### System Args
 parser.add_argument("--use_best_hyperparams", action="store_true")
