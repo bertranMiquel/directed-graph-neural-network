@@ -194,10 +194,8 @@ def reverse_edge_ratio_metrics(data: PyGData) -> dict[str, float]:
     ei = get_edge_index_numpy(data)
     if ei.shape[1] == 0:
         return {
-            "reverse_edge_ratio": float("nan"),
             "missing_reverse_edges": float("nan"),
             "unique_directed_edges_no_self_loops": 0.0,
-            "reciprocity_ratio": float("nan"),
             "bidirectionality_gap": float("nan"),
         }
 
@@ -208,10 +206,8 @@ def reverse_edge_ratio_metrics(data: PyGData) -> dict[str, float]:
     dst = dst[mask]
     if src.size == 0:
         return {
-            "reverse_edge_ratio": float("nan"),
             "missing_reverse_edges": float("nan"),
             "unique_directed_edges_no_self_loops": 0.0,
-            "reciprocity_ratio": float("nan"),
             "bidirectionality_gap": float("nan"),
         }
 
@@ -229,10 +225,8 @@ def reverse_edge_ratio_metrics(data: PyGData) -> dict[str, float]:
     reciprocity = float(1.0 - reverse_ratio) if total > 0 else float("nan")
 
     return {
-        "reverse_edge_ratio": 100.0 * reverse_ratio if total > 0 else float("nan"),
         "missing_reverse_edges": float(missing),
         "unique_directed_edges_no_self_loops": float(total),
-        "reciprocity_ratio": 100.0 * reciprocity if total > 0 else float("nan"),
         "bidirectionality_gap": 100.0 * reverse_ratio if total > 0 else float("nan"),
     }
 
@@ -313,6 +307,8 @@ def directional_node_role_metrics(data: PyGData) -> dict[str, float]:
 def scc_fragmentation_metrics(G: nx.Graph | nx.DiGraph) -> dict[str, float]:
     """
     Global one-way organization metrics.
+    Condensation graph measures included as a way to capture "hierarchy" and "feedforwardness".
+    It does not capture all aspects of hierarchy, but is a simple and interpretable proxy that can be computed efficiently.
     """
     out = {
         "n_strongly_connected_components": float("nan"),
@@ -402,6 +398,8 @@ def reachability_asymmetry_metrics(
     """
     Approximate reachability asymmetry using sampled BFS/DFS sources.
     Memory-wise: no all-pairs matrix, only per-source reachability sets.
+    transitivity: for pairs of nodes (u, v) reachable in at least one direction, 
+                what fraction are reachable in exactly one direction?
     """
     out = {
         "reachability_asymmetry": float("nan"),
