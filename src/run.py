@@ -8,15 +8,15 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelSummary, ModelCheckpoint
 
-from src.utils.utils import use_best_hyperparams, get_available_accelerator
-from src.datasets.data_loading import get_dataset, get_dataset_split
-from src.datasets.dataset import FullBatchGraphDataset
-from src.model import get_model, LightingFullBatchModelWrapper
-from src.utils.arguments import args
+from .utils.utils import use_best_hyperparams, get_available_accelerator
+from .datasets.data_loading import get_dataset, get_dataset_split
+from .datasets.dataset import FullBatchGraphDataset
+from .model import get_model, LightingFullBatchModelWrapper
+from .utils.arguments import args
 
 
 def run(args):
-    torch.manual_seed(0)
+    # torch.manual_seed(0)
 
     # Get dataset and dataloader
     dataset, evaluator = get_dataset(
@@ -31,6 +31,7 @@ def run(args):
 
     val_accs, test_accs = [], []
     for num_run in range(args.num_runs):
+        torch.manual_seed(num_run)
         # Get train/val/test splits for the current run
         train_mask, val_mask, test_mask = get_dataset_split(args.dataset, data, args.dataset_directory, num_run)
 
@@ -81,7 +82,8 @@ def run(args):
         test_accs.append(test_acc)
         val_accs.append(val_acc)
 
-    print(f"Test Acc: {np.mean(test_accs)} +- {np.std(test_accs)}")
+    print(args)
+    print(f"Dataset:{args.dataset} Model:{args.conv_type} Alpha: {args.alpha} Test Acc: {np.mean(test_accs)} +- {np.std(test_accs)}")
 
 
 if __name__ == "__main__":
