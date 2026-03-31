@@ -9,6 +9,10 @@ from torch_geometric.data import download_url
 from torch_geometric.datasets import (
     WikipediaNetwork,
     CitationFull,
+    Planetoid,
+    Amazon,
+    Coauthor,
+    WebKB,
 )
 import torch_geometric.transforms as transforms
 from ogb.nodeproppred import PygNodePropPredDataset, Evaluator
@@ -22,7 +26,6 @@ from src.utils.third_party import (
 )
 from src.datasets.synthetic import get_syn_dataset
 
-
 def get_dataset(name: str, root_dir: str, homophily=None, undirected=False, self_loops=False, transpose=False):
     path = f"{root_dir}/"
     evaluator = None
@@ -30,6 +33,22 @@ def get_dataset(name: str, root_dir: str, homophily=None, undirected=False, self
     if name in ["chameleon", "squirrel"]:
         dataset = WikipediaNetwork(root=path, name=name, transform=transforms.NormalizeFeatures())
         dataset._data.y = dataset._data.y.unsqueeze(-1)
+
+    elif name in ["pubmed"]:
+        dataset = Planetoid(root=path, name="PubMed", transform=transforms.NormalizeFeatures())
+
+    elif name in ["amazon-computers", "amazon_computers", "computers"]:
+        dataset = Amazon(root=path, name="Computers", transform=transforms.NormalizeFeatures())
+
+    elif name in ["coauthor-cs", "coauthor_cs", "cs"]:
+        dataset = Coauthor(root=path, name="CS", transform=transforms.NormalizeFeatures())
+
+    elif name in ["coauthor-phy", "coauthor_phy", "phy"]:
+        dataset = Coauthor(root=path, name="Physics", transform=transforms.NormalizeFeatures())
+
+    elif name in ["cornell", "texas", "wisconsin"]:
+        dataset = WebKB(root=path, name=name, transform=transforms.NormalizeFeatures())
+
     elif name in ["ogbn-arxiv"]:
         dataset = PygNodePropPredDataset(name=name, transform=transforms.ToSparseTensor(), root=path)
         evaluator = Evaluator(name=name)
@@ -37,21 +56,21 @@ def get_dataset(name: str, root_dir: str, homophily=None, undirected=False, self
         dataset._data.train_mask = get_mask(split_idx["train"], dataset._data.num_nodes)
         dataset._data.val_mask = get_mask(split_idx["valid"], dataset._data.num_nodes)
         dataset._data.test_mask = get_mask(split_idx["test"], dataset._data.num_nodes)
+
     elif name in ["directed-roman-empire"]:
         dataset = DirectedHeterophilousGraphDataset(name=name, transform=transforms.NormalizeFeatures(), root=path)
+
     elif name == "snap-patents":
         dataset = load_snap_patents_mat(n_classes=5, root=path)
+
     elif name == "arxiv-year":
-        # arxiv-year uses the same graph and features as ogbn-arxiv, but with different labels
         dataset = PygNodePropPredDataset(name="ogbn-arxiv", transform=transforms.ToSparseTensor(), root=path)
         evaluator = Evaluator(name="ogbn-arxiv")
         y = even_quantile_labels(dataset._data.node_year.flatten().numpy(), nclasses=5, verbose=False)
         dataset._data.y = torch.as_tensor(y).reshape(-1, 1)
-        # Tran, val and test masks are required during preprocessing. Setting them here to dummy values as
-        # they are overwritten later for this dataset (see get_dataset_split function below)
         dataset._data.train_mask, dataset._data.val_mask, dataset._data.test_mask = 0, 0, 0
-        # Create directory for this dataset
         os.makedirs(os.path.join(path, name.replace("-", "_"), "raw"), exist_ok=True)
+
     elif name == "syn-dir":
         dataset = get_syn_dataset(path)
 
@@ -59,8 +78,10 @@ def get_dataset(name: str, root_dir: str, homophily=None, undirected=False, self
         if name == "citeseer_full":
             name = "citeseer"
         dataset = CitationFull(path, name)
+
     elif name == "telegram":
         dataset = Telegram(path)
+
     else:
         raise Exception("Unknown dataset.")
 
@@ -73,20 +94,21 @@ def get_dataset(name: str, root_dir: str, homophily=None, undirected=False, self
 
     return dataset, evaluator
 
-
 def get_dataset_split(name, data, root_dir, split_number):
-    if name in ["snap-patents", "chameleon", "squirrel", "telegram", "directed-roman-empire"]:
+    if name in ["snap-patents", "chameleon", "squirrel", "telegram", "directed-roman-empire", "cornell", "texas", "wisconsin"]:
         return (
             data["train_mask"][:, split_number],
             data["val_mask"][:, split_number],
             data["test_mask"][:, split_number],
         )
-    if name in ["ogbn-arxiv"]:
-        # OGBN datasets have a single pre-assigned split
-        return data["train_mask"], data["val_mask"], data["test_mask"]
+    if name in ["ogbn-arxiv", "pubmed", "amazon-computers", "amazon_computers", "computers", "coauthor-cs", "coauthor_cs", "cs", "coauthor-phy", "coauthor_phy", "phy"]:
+        try:
+            return data["train_mask"], data["val_mask"], data["test_mask"]
+        except:
+            print("Dataset does not have predefined splits. Using uniform random split instead 50/25/25.")
+            return set_uniform_train_val_test_split(split_number, data, train_ratio=0.5, val_ratio=0.25)
+
     if name in ["arxiv-year"]:
-        # Datasets from https://arxiv.org/pdf/2110.14446.pdf have five splits stored
-        # in https://github.com/CUAI/Non-Homophily-Large-Scale/tree/82f8f05c5c3ec16bd5b505cc7ad62ab5e09051e6/data/splits
         num_nodes = data["y"].shape[0]
         github_url = f"https://github.com/CUAI/Non-Homophily-Large-Scale/raw/master/data/splits/"
         split_file_name = f"{name}-splits.npy"
