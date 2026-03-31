@@ -34,7 +34,7 @@ DATASET_GROUPS = {
         "squirrel",
         "arxiv-year",
         "snap-patents",
-        "roman-empire",
+        "directed-roman-empire",
     ],
 }
 
@@ -74,6 +74,16 @@ def normalize_model_name(model: str) -> str:
     }
     return mapping.get(model, model.replace("_", "-"))
 
+def normalize_alpha(model: str, alpha_value):
+    """
+    Ignore alpha for directed models.
+    Keep alpha for non-directed models if present.
+    """
+    model = normalize_model_name(model)
+
+    if not model.startswith("dir"):
+        return None
+    return alpha_value
 
 def extract_alpha_from_text(text: str) -> float | None:
     if text is None:
@@ -98,7 +108,7 @@ def format_model_for_table(model: str, alpha: float | None) -> str:
     if model.startswith("dir-"):
         if alpha is None:
             return f"DIR-{fam}"
-        return f"DIR-{fam}($\\alpha$={alpha:.1f})"
+        return f"DIR-{fam}($\\alpha$={alpha})"
     return fam
 
 
@@ -144,15 +154,17 @@ CONNECTIVITY_METRICS = [
 ]
 
 # Explicit format:
-# Dataset:citeseer_full Model:gcn Test Acc: 0.9330812931060791 +- 0.006667379664282218
+# Dataset:citeseer_full Model:dir-gcn Alpha:0.5 Test Acc: 0.9330812931060791 +- 0.006667379664282218
 ACC_RE_EXPLICIT = re.compile(
-    r"Dataset:(?P<dataset>\S+)\s+Model:(?P<model>\S+)\s+Test Acc:\s+"
-    r"(?P<mean>[0-9eE+\-.]+)\s*\+\-\s*(?P<std>[0-9eE+\-.]+)"
+    r"Dataset:(?P<dataset>\S+)\s+Model:(?P<model>\S+)"
+    r"(?:\s+Alpha:\s*(?P<alpha>[0-9eE+\-.]+))?"
+    r"\s+Test Acc:\s+(?P<mean>[0-9eE+\-.]+)\s*\+\-\s*(?P<std>[0-9eE+\-.]+)"
 )
 
 ACC_RE_EXPLICIT_FALLBACK = re.compile(
-    r"Dataset:(?P<dataset>\S+)\s+Model:(?P<model>\S+)\s+Test Acc:\s+"
-    r"(?P<mean>[0-9eE+\-.]+)"
+    r"Dataset:(?P<dataset>\S+)\s+Model:(?P<model>\S+)"
+    r"(?:\s+Alpha:\s*(?P<alpha>[0-9eE+\-.]+))?"
+    r"\s+Test Acc:\s+(?P<mean>[0-9eE+\-.]+)"
 )
 
 # Compact format:
@@ -327,14 +339,19 @@ def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> lis
             if "OOM" in line.upper():
                 continue
 
+            # Explicit format:
+            # Dataset:... Model:... Alpha: ... Test Acc: ...
             m = ACC_RE_EXPLICIT.search(line)
             if m:
                 model_raw = m.group("model")
+                model_norm = normalize_model_name(model_raw)
+                alpha = normalize_alpha(model_raw, m.group("alpha"))
+
                 rows.append({
                     "dataset": m.group("dataset"),
                     "model_raw": model_raw,
-                    "model": normalize_model_name(model_raw),
-                    "alpha": extract_alpha_from_text(model_raw),
+                    "model": model_norm,
+                    "alpha": alpha,
                     "test_acc_mean": float(m.group("mean")),
                     "test_acc_std": float(m.group("std")),
                     "source_file": str(path),
@@ -345,11 +362,14 @@ def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> lis
             m = ACC_RE_EXPLICIT_FALLBACK.search(line)
             if m:
                 model_raw = m.group("model")
+                model_norm = normalize_model_name(model_raw)
+                alpha = normalize_alpha(model_raw, m.group("alpha"))
+
                 rows.append({
                     "dataset": m.group("dataset"),
                     "model_raw": model_raw,
-                    "model": normalize_model_name(model_raw),
-                    "alpha": extract_alpha_from_text(model_raw),
+                    "model": model_norm,
+                    "alpha": alpha,
                     "test_acc_mean": float(m.group("mean")),
                     "test_acc_std": np.nan,
                     "source_file": str(path),
@@ -357,14 +377,19 @@ def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> lis
                 })
                 continue
 
+            # Compact format:
+            # dir-gcn Test Acc: ...
             m = ACC_RE_COMPACT.search(line)
             if m and dataset_fallback is not None:
                 model_raw = m.group("model")
+                model_norm = normalize_model_name(model_raw)
+                alpha = normalize_alpha(model_raw, None)
+
                 rows.append({
                     "dataset": dataset_fallback,
                     "model_raw": model_raw,
-                    "model": normalize_model_name(model_raw),
-                    "alpha": extract_alpha_from_text(model_raw),
+                    "model": model_norm,
+                    "alpha": alpha,
                     "test_acc_mean": float(m.group("mean")),
                     "test_acc_std": float(m.group("std")),
                     "source_file": str(path),
@@ -375,11 +400,14 @@ def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> lis
             m = ACC_RE_COMPACT_FALLBACK.search(line)
             if m and dataset_fallback is not None:
                 model_raw = m.group("model")
+                model_norm = normalize_model_name(model_raw)
+                alpha = normalize_alpha(model_raw, None)
+
                 rows.append({
                     "dataset": dataset_fallback,
                     "model_raw": model_raw,
-                    "model": normalize_model_name(model_raw),
-                    "alpha": extract_alpha_from_text(model_raw),
+                    "model": model_norm,
+                    "alpha": alpha,
                     "test_acc_mean": float(m.group("mean")),
                     "test_acc_std": np.nan,
                     "source_file": str(path),
@@ -389,8 +417,8 @@ def parse_log_file(path: str | Path, dataset_fallback: str | None = None) -> lis
 
     if len(rows) == 0:
         log.warning(f"No accuracy lines parsed from log file: {path}")
-    return rows
 
+    return rows
 
 def load_accuracy_logs(logs_dir: str | Path) -> pd.DataFrame:
     rows: list[dict] = []

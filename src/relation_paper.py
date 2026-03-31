@@ -30,6 +30,12 @@ log = logging.getLogger("relation_from_table")
 
 CONNECTIVITY_METRICS = [
     "bidirectionality_gap",
+    "directional_imbalance_mean",
+    "fraction_near_sinks",
+    "fraction_near_sources",
+    "fraction_edges_between_sccs",
+    "condensation_density",
+    "in_out_label_jsd_mean",
     "density",
     "homophility",
     "degree_mean",
@@ -42,7 +48,7 @@ CONNECTIVITY_METRICS = [
     "eccentricity_mean_LCC",
     "cheeger_constant_LCC",
     "algebraic_connectivity_lambda2_LCC",
-    "spectral_gap"
+    "spectral_gap",
 ]
 
 MODEL_VARIANTS = {
@@ -738,6 +744,53 @@ def compute_second_order_models(master_df: pd.DataFrame, out_dir: Path) -> pd.Da
 # ---------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------
+import math
+
+
+def _make_metric_grid(
+    n_metrics: int,
+    max_cols: int = 4,
+    panel_w: float = 4.6,
+    panel_h: float = 4.1,
+    sharey: bool = False,
+):
+    n_cols = min(max_cols, max(1, n_metrics))
+    n_rows = math.ceil(n_metrics / n_cols)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(panel_w * n_cols, panel_h * n_rows),
+        sharey=sharey,
+        squeeze=False,
+    )
+    axes_flat = axes.ravel()
+    return fig, axes, axes_flat, n_rows, n_cols
+
+
+def _hide_unused_axes(axes_flat, n_used: int) -> None:
+    for ax in axes_flat[n_used:]:
+        ax.set_visible(False)
+
+
+def _place_title_and_legend_grid(fig, title: str, legend_handles, legend_labels, n_cols: int) -> None:
+    fig.suptitle(title, x=0.36, y=0.985, ha="center", fontweight="bold")
+    if legend_handles and legend_labels:
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            title="Dataset",
+            loc="upper left",
+            bbox_to_anchor=(0.73, 0.99),
+            ncol=2,
+            frameon=False,
+            fontsize=8,
+            title_fontsize=9,
+            columnspacing=1.0,
+            handletextpad=0.35,
+            borderaxespad=0.0,
+        )
+
 
 def plot_scatter_by_model(master_df: pd.DataFrame, corr_df: pd.DataFrame, out_dir: Path, title_suffix: str) -> None:
     plot_dir = safe_mkdir(out_dir / "scatter_by_model")
@@ -745,16 +798,23 @@ def plot_scatter_by_model(master_df: pd.DataFrame, corr_df: pd.DataFrame, out_di
     palette = get_dataset_palette(datasets)
     legend_handles, legend_labels = _figure_legend_handles(datasets, palette)
 
+    n_metrics = len(CONNECTIVITY_METRICS)
+
     for model_pair, grp in master_df.groupby("model_pair"):
         sub_corr = corr_df[corr_df["model_pair"] == model_pair].copy()
         if sub_corr.empty:
             continue
 
-        fig, axes = plt.subplots(1, len(CONNECTIVITY_METRICS), figsize=(15.2, 4.2), sharey=True)
-        axes = np.atleast_1d(axes).ravel()
+        fig, axes_flat, n_rows, n_cols = _make_metric_grid(
+            n_items=n_metrics,
+            max_cols=4,
+            panel_w=4.8,
+            panel_h=4.3,
+            sharey=False,
+        )
 
         for i, metric in enumerate(CONNECTIVITY_METRICS):
-            ax = axes[i]
+            ax = axes_flat[i]
             plot_sub = grp.dropna(subset=[metric, "delta_acc", "dataset"]).copy()
             if plot_sub.empty:
                 ax.set_visible(False)
@@ -762,6 +822,7 @@ def plot_scatter_by_model(master_df: pd.DataFrame, corr_df: pd.DataFrame, out_di
 
             x = plot_sub[metric].values.astype(float)
             y = plot_sub["delta_acc"].values.astype(float)
+
             _scatter_points(ax, plot_sub, metric, "delta_acc", palette)
             _draw_regression(ax, x, y)
             ax.axhline(0, color="0.8", linestyle=":", linewidth=1.0, zorder=1)
@@ -772,29 +833,52 @@ def plot_scatter_by_model(master_df: pd.DataFrame, corr_df: pd.DataFrame, out_di
 
             ax.set_title(clean_metric_name(metric))
             ax.set_xlabel(clean_metric_name(metric))
-            if i == 0:
-                ax.set_ylabel("Δ Accuracy (Directed - Base)")
-            else:
-                ax.set_ylabel("")
+            ax.set_ylabel("Δ Accuracy (Directed - Base)")
 
-        _place_title_and_legend(fig, f"Connectivity vs Δ Accuracy — {pretty_model_pair(model_pair)} — {title_suffix}", legend_handles, legend_labels)
-        fig.subplots_adjust(left=0.07, right=0.99, bottom=0.16, top=0.76, wspace=0.18)
+        _hide_unused_axes(axes_flat, n_metrics)
+        _place_title_and_legend_grid(
+            fig,
+            f"Connectivity vs Δ Accuracy — {pretty_model_pair(model_pair)} — {title_suffix}",
+            legend_handles,
+            legend_labels,
+            n_cols=n_cols,
+        )
+
+        fig.subplots_adjust(
+            left=0.06,
+            right=0.98,
+            bottom=0.07,
+            top=0.88,
+            wspace=0.28,
+            hspace=0.38,
+        )
         fig.savefig(plot_dir / f"scatter_{model_pair}.png", bbox_inches="tight")
         plt.close(fig)
 
 
 def plot_scatter_all_models(master_df: pd.DataFrame, corr_df: pd.DataFrame, out_dir: Path, title_suffix: str) -> None:
     plot_dir = safe_mkdir(out_dir / "scatter_all_models")
-    sub_corr = corr_df[(corr_df["scope"] == "pooled_all_models") & (corr_df["model_pair"] == "all")].copy()
+    sub_corr = corr_df[
+        (corr_df["scope"] == "pooled_all_models") & (corr_df["model_pair"] == "all")
+    ].copy()
+
     datasets = sorted(master_df["dataset"].dropna().unique().tolist())
     palette = get_dataset_palette(datasets)
     legend_handles, legend_labels = _figure_legend_handles(datasets, palette)
 
-    fig, axes = plt.subplots(1, len(CONNECTIVITY_METRICS), figsize=(15.2, 4.2), sharey=True)
-    axes = np.atleast_1d(axes).ravel()
+    n_metrics = len(CONNECTIVITY_METRICS)
+
+    # fig, axes, axes_flat, n_rows, n_cols = _make_metric_grid(
+    fig, axes_flat, n_rows, n_cols = _make_metric_grid(
+        n_items=n_metrics,
+        max_cols=4,
+        panel_w=4.8,
+        panel_h=4.3,
+        sharey=False,
+    )
 
     for i, metric in enumerate(CONNECTIVITY_METRICS):
-        ax = axes[i]
+        ax = axes_flat[i]
         plot_sub = master_df.dropna(subset=[metric, "delta_acc", "dataset"]).copy()
         if plot_sub.empty:
             ax.set_visible(False)
@@ -802,6 +886,7 @@ def plot_scatter_all_models(master_df: pd.DataFrame, corr_df: pd.DataFrame, out_
 
         x = plot_sub[metric].values.astype(float)
         y = plot_sub["delta_acc"].values.astype(float)
+
         _scatter_points(ax, plot_sub, metric, "delta_acc", palette)
         _draw_regression(ax, x, y)
         ax.axhline(0, color="0.8", linestyle=":", linewidth=1.0, zorder=1)
@@ -812,13 +897,27 @@ def plot_scatter_all_models(master_df: pd.DataFrame, corr_df: pd.DataFrame, out_
 
         ax.set_title(clean_metric_name(metric))
         ax.set_xlabel(clean_metric_name(metric))
-        ax.set_ylabel("Δ Accuracy (Directed - Base)" if i == 0 else "")
+        ax.set_ylabel("Δ Accuracy (Directed - Base)")
 
-    _place_title_and_legend(fig, f"Connectivity vs Δ Accuracy — All Model Pairs — {title_suffix}", legend_handles, legend_labels)
-    fig.subplots_adjust(left=0.07, right=0.99, bottom=0.16, top=0.76, wspace=0.18)
+    _hide_unused_axes(axes_flat, n_metrics)
+    _place_title_and_legend_grid(
+        fig,
+        f"Connectivity vs Δ Accuracy — All Model Pairs — {title_suffix}",
+        legend_handles,
+        legend_labels,
+        n_cols=n_cols,
+    )
+
+    fig.subplots_adjust(
+        left=0.06,
+        right=0.98,
+        bottom=0.07,
+        top=0.88,
+        wspace=0.28,
+        hspace=0.38,
+    )
     fig.savefig(plot_dir / "scatter_all_model_pairs.png", bbox_inches="tight")
     plt.close(fig)
-
 
 def plot_heatmap_per_model(corr_df: pd.DataFrame, out_dir: Path, title_suffix: str) -> None:
     if sns is None:
@@ -849,59 +948,280 @@ def plot_heatmap_per_model(corr_df: pd.DataFrame, out_dir: Path, title_suffix: s
     plt.savefig(plot_dir / "heatmap_spearman_per_model.png", bbox_inches="tight")
     plt.close()
 
+import math
+import textwrap
 
-def plot_significance_bars(corr_df: pd.DataFrame, out_dir: Path, title_suffix: str) -> None:
-    plot_dir = safe_mkdir(out_dir / "significance")
-    sub = corr_df[corr_df["scope"] == "pooled_by_model_pair"].copy()
-    sub = sub[sub["spearman_r"].notna()].copy()
-    if sub.empty:
-        return
 
-    for metric in CONNECTIVITY_METRICS:
-        mdf = sub[sub["metric"] == metric].copy()
-        if mdf.empty:
-            continue
-        mdf = mdf.sort_values("spearman_r", key=lambda s: s.abs(), ascending=False)
+def _pretty_metric_label(metric: str, width: int = 18) -> str:
+    label = metric.replace("_", " ")
+    return "\n".join(textwrap.wrap(label, width=width, break_long_words=False))
 
-        fig, ax = plt.subplots(figsize=(10.5, 4.0))
-        ax.bar(mdf["model_pair"], mdf["spearman_r"], color="0.45")
-        ax.axhline(0, color="black", linewidth=0.8)
-        for i, (_, row) in enumerate(mdf.iterrows()):
-            txt = significance_stars(row["spearman_p"])
-            ax.text(i, row["spearman_r"], f" {txt}", va="bottom" if row["spearman_r"] >= 0 else "top", fontsize=9)
-        ax.set_title(f"{clean_metric_name(metric)} vs Δ Accuracy — {title_suffix}", fontweight="bold")
-        ax.set_ylabel("Spearman r")
-        ax.set_xlabel("Model Pair")
-        plt.xticks(rotation=35, ha="right")
-        plt.tight_layout()
-        plt.savefig(plot_dir / f"significance_{metric}.png", bbox_inches="tight")
-        plt.close(fig)
+
+def _make_metric_grid(
+    n_items: int,
+    max_cols: int = 4,
+    panel_w: float = 4.8,
+    panel_h: float = 4.2,
+    sharex: bool = False,
+    sharey: bool = False,
+):
+    n_cols = min(max_cols, max(1, n_items))
+    n_rows = math.ceil(n_items / n_cols)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(panel_w * n_cols, panel_h * n_rows),
+        squeeze=False,
+        sharex=sharex,
+        sharey=sharey,
+    )
+    return fig, axes.ravel(), n_rows, n_cols
+
+
+def _hide_unused_axes(axes_flat, n_used: int) -> None:
+    for ax in axes_flat[n_used:]:
+        ax.set_visible(False)
+
+
+def _significance_color(p: float) -> str:
+    if pd.isna(p):
+        return "0.75"
+    if p < 0.05:
+        return "#2a7fff"
+    return "0.75"
+
+
+def _significance_label(p: float) -> str:
+    if pd.isna(p):
+        return "n/a"
+    if p < 1e-3:
+        return "***"
+    if p < 1e-2:
+        return "**"
+    if p < 5e-2:
+        return "*"
+    return "ns"
 
 
 def plot_connectivity_heatmap(df: pd.DataFrame, out_dir: Path) -> None:
     if sns is None:
         log.info("Seaborn not available; skipping connectivity heatmap.")
         return
+
     sub = df[CONNECTIVITY_METRICS].dropna()
     if len(sub) < 2:
         return
 
     corr = sub.corr(method="spearman")
-    plt.figure(figsize=(5.8, 4.6))
-    sns.heatmap(
+    n_metrics = corr.shape[0]
+
+    # Larger figure for many metrics
+    fig_w = max(10.0, 0.75 * n_metrics + 4.0)
+    fig_h = max(8.0, 0.75 * n_metrics + 2.0)
+
+    # Avoid unreadable white-number clutter when too many metrics
+    annotate = n_metrics <= 12
+    annot_kws = {"size": 8} if annotate else None
+
+    xlabels = [_pretty_metric_label(c, width=16) for c in corr.columns]
+    ylabels = [_pretty_metric_label(i, width=20) for i in corr.index]
+
+    plt.figure(figsize=(fig_w, fig_h))
+    ax = sns.heatmap(
         corr,
-        annot=True,
-        fmt=".2f",
+        annot=annotate,
+        fmt=".2f" if annotate else "",
         cmap="RdBu_r",
         center=0,
-        linewidths=0.5,
-        cbar_kws={"label": "Spearman r"},
+        vmin=-1,
+        vmax=1,
+        linewidths=0.4,
+        linecolor="white",
+        cbar_kws={"label": "Spearman r", "shrink": 0.9},
+        annot_kws=annot_kws,
+        square=True,
     )
-    plt.title("Connectivity Metrics Correlation", fontweight="bold", pad=10)
+
+    ax.set_xticklabels(xlabels, rotation=45, ha="right")
+    ax.set_yticklabels(ylabels, rotation=0)
+    ax.set_title("Connectivity Metrics Correlation", fontweight="bold", pad=12)
+
     plt.tight_layout()
     plt.savefig(out_dir / "connectivity_heatmap.png", bbox_inches="tight")
     plt.close()
 
+
+def plot_significance_bars(corr_df: pd.DataFrame, out_dir: Path, title_suffix: str) -> None:
+    """
+    One single overview figure with all metrics together.
+    One panel per metric, max 4 panels per row.
+    Bars are colored by significance.
+    """
+    plot_dir = safe_mkdir(out_dir / "significance")
+    sub = corr_df[corr_df["scope"] == "pooled_by_model_pair"].copy()
+    sub = sub[sub["spearman_r"].notna()].copy()
+    if sub.empty:
+        return
+
+    metrics = [m for m in CONNECTIVITY_METRICS if m in sub["metric"].unique()]
+    if not metrics:
+        return
+
+    # Sort panels so the strongest metric appears first
+    metric_strength = (
+        sub.groupby("metric")["spearman_r"]
+        .apply(lambda s: np.nanmax(np.abs(s.values)) if len(s) else np.nan)
+        .sort_values(ascending=False)
+    )
+    metrics = [m for m in metric_strength.index.tolist() if m in metrics]
+
+    fig, axes_flat, n_rows, n_cols = _make_metric_grid(
+        n_items=len(metrics),
+        max_cols=4,
+        panel_w=5.2,
+        panel_h=4.5,
+        sharey=True,
+    )
+
+    y_lim = 1.0
+    if not sub["spearman_r"].dropna().empty:
+        y_lim = max(0.2, min(1.0, 1.10 * np.abs(sub["spearman_r"]).max()))
+
+    for i, metric in enumerate(metrics):
+        ax = axes_flat[i]
+        mdf = sub[sub["metric"] == metric].copy()
+        if mdf.empty:
+            ax.set_visible(False)
+            continue
+
+        mdf = mdf.sort_values("spearman_r", key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
+        colors = [_significance_color(p) for p in mdf["spearman_p"]]
+
+        xpos = np.arange(len(mdf))
+        ax.bar(
+            xpos,
+            mdf["spearman_r"].values,
+            color=colors,
+            edgecolor="black",
+            linewidth=0.7,
+        )
+        ax.axhline(0, color="black", linewidth=0.9)
+        ax.set_ylim(-y_lim, y_lim)
+
+        for j, (_, row) in enumerate(mdf.iterrows()):
+            label = _significance_label(row["spearman_p"])
+            y = row["spearman_r"]
+            offset = 0.03 * y_lim
+            ax.text(
+                j,
+                y + offset if y >= 0 else y - offset,
+                label,
+                ha="center",
+                va="bottom" if y >= 0 else "top",
+                fontsize=9,
+                fontweight="bold",
+            )
+
+        ax.set_title(_pretty_metric_label(clean_metric_name(metric), width=22), fontweight="bold")
+        ax.set_xticks(xpos)
+        ax.set_xticklabels(
+            [pretty_model_pair(x) for x in mdf["model_pair"]],
+            rotation=28,
+            ha="right",
+        )
+        ax.set_ylabel("Spearman r")
+        ax.grid(False)
+
+    _hide_unused_axes(axes_flat, len(metrics))
+
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(facecolor="#2a7fff", edgecolor="black", label="p < 0.05"),
+        Patch(facecolor="0.75", edgecolor="black", label="p ≥ 0.05"),
+    ]
+
+    fig.suptitle(
+        f"Spearman significance overview — {title_suffix}",
+        y=0.992,
+        fontweight="bold",
+        fontsize=18,
+    )
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.955),
+        ncol=2,
+        frameon=False,
+        fontsize=10,
+    )
+
+    fig.subplots_adjust(
+        left=0.05,
+        right=0.985,
+        bottom=0.07,
+        top=0.90,
+        wspace=0.24,
+        hspace=0.42,
+    )
+    fig.savefig(plot_dir / "significance_overview_spearman.png", bbox_inches="tight")
+    plt.close(fig)
+
+def plot_spearman_overview_heatmap(corr_df: pd.DataFrame, out_dir: Path, title_suffix: str) -> None:
+    if sns is None:
+        return
+
+    plot_dir = safe_mkdir(out_dir / "significance")
+    sub = corr_df[corr_df["scope"] == "pooled_by_model_pair"].copy()
+    sub = sub[sub["spearman_r"].notna()].copy()
+    if sub.empty:
+        return
+
+    pivot_r = sub.pivot(index="metric", columns="model_pair", values="spearman_r")
+    pivot_p = sub.pivot(index="metric", columns="model_pair", values="spearman_p")
+
+    metric_order = (
+        sub.groupby("metric")["spearman_r"]
+        .apply(lambda s: np.nanmax(np.abs(s.values)) if len(s) else np.nan)
+        .sort_values(ascending=False)
+        .index.tolist()
+    )
+    pivot_r = pivot_r.loc[[m for m in metric_order if m in pivot_r.index]]
+
+    annot = pivot_r.copy().astype(object)
+    for r in pivot_r.index:
+        for c in pivot_r.columns:
+            val = pivot_r.loc[r, c]
+            p = pivot_p.loc[r, c] if (r in pivot_p.index and c in pivot_p.columns) else np.nan
+            if pd.isna(val):
+                annot.loc[r, c] = ""
+            else:
+                annot.loc[r, c] = f"{val:.2f}\n{_significance_label(p)}"
+
+    fig_w = max(8.5, 1.5 * len(pivot_r.columns) + 2.0)
+    fig_h = max(6.5, 0.65 * len(pivot_r.index) + 2.0)
+
+    plt.figure(figsize=(fig_w, fig_h))
+    ax = sns.heatmap(
+        pivot_r,
+        annot=annot,
+        fmt="",
+        cmap="RdBu_r",
+        center=0,
+        vmin=-1,
+        vmax=1,
+        linewidths=0.5,
+        linecolor="white",
+        cbar_kws={"label": "Spearman r"},
+        annot_kws={"size": 8},
+    )
+
+    ax.set_xticklabels([pretty_model_pair(x) for x in pivot_r.columns], rotation=30, ha="right")
+    ax.set_yticklabels([_pretty_metric_label(x, width=24) for x in pivot_r.index], rotation=0)
+    ax.set_title(f"Spearman overview heatmap — {title_suffix}", fontweight="bold", pad=12)
+
+    plt.tight_layout()
+    plt.savefig(plot_dir / "spearman_overview_heatmap.png", bbox_inches="tight")
+    plt.close()
 
 def plot_connectivity_scatter(df: pd.DataFrame, out_dir: Path) -> None:
     plot_dir = safe_mkdir(out_dir / "connectivity_scatter")
@@ -1053,6 +1373,7 @@ def run_analysis(
     plot_scatter_all_models(master_df, pooled_corr, out_dir, title_suffix)
     plot_heatmap_per_model(pooled_corr, out_dir, title_suffix)
     plot_significance_bars(pooled_corr, out_dir, title_suffix)
+    plot_spearman_overview_heatmap(pooled_corr, out_dir, title_suffix)
     build_summary_tables(master_df, pooled_corr, out_dir)
     build_model_comparison_tables(single_df, second_df, out_dir)
     plot_second_order_heatmap(pd.concat([single_df, second_df], ignore_index=True), out_dir, title_suffix)
