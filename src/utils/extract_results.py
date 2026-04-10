@@ -1,5 +1,13 @@
 """
-Example: python src/utils/extract_results.py --folder1 logs/run --folder2 logs/run_homo_dir --label1 baseline --label2 homo_dir
+Paper-ready result extraction and plotting for baseline vs directed GNN comparisons.
+
+Example:
+python extract_results_paper_ready.py \
+    --folder1 logs/run \
+    --folder2 logs/run_homo_dir \
+    --label1 baseline \
+    --label2 homo_dir \
+    --output-dir results
 """
 import argparse
 import csv
@@ -9,9 +17,11 @@ from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 DIRECTED_ALPHA_ORDER = ["0.0", "0.5", "1.0"]
 MODEL_FAMILIES = ["gcn", "sage", "gat"]
+
 DATASET_GROUPS = {
     "homophilic": [
         "amazon-computers",
@@ -40,22 +50,29 @@ LOG_RE = re.compile(
     r"Test Acc:\s*(?P<mean>[0-9eE+\-.]+)\s*\+\-\s*(?P<std>[0-9eE+\-.]+)"
 )
 
+SERIES_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756"]
+MODEL_DISPLAY = {"gcn": "GCN", "sage": "SAGE", "gat": "GAT"}
+
 
 def setup_plot_style():
     plt.rcParams.update({
-        "font.size": 11,
-        "axes.titlesize": 14,
-        "axes.labelsize": 12,
+        "font.family": "DejaVu Sans",
+        "font.size": 10,
+        "axes.titlesize": 13,
+        "axes.titleweight": "bold",
+        "axes.labelsize": 11,
+        "axes.labelweight": "bold",
         "xtick.labelsize": 9,
-        "ytick.labelsize": 10,
-        "legend.fontsize": 10,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 9,
         "figure.dpi": 160,
         "savefig.dpi": 300,
+        "savefig.bbox": "tight",
         "axes.spines.top": False,
         "axes.spines.right": False,
         "axes.linewidth": 0.8,
         "grid.linewidth": 0.6,
-        "grid.alpha": 0.25,
+        "grid.alpha": 0.18,
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
     })
@@ -86,8 +103,8 @@ def parse_log_file(path):
             dataset = m.group("dataset").lower()
             model = m.group("model").lower()
             alpha = m.group("alpha")
-            mean = float(m.group("mean")) * 100
-            std = float(m.group("std")) * 100
+            mean = float(m.group("mean")) * 100.0
+            std = float(m.group("std")) * 100.0
 
             if model.startswith("dir-") and alpha is None:
                 k = (dataset, model)
@@ -112,9 +129,10 @@ def merge_results(*dicts):
 
 def parse_results_root(root):
     root = Path(root)
+    subdirs = [p for p in root.iterdir() if p.is_dir()]
     return merge_results(*[
         parse_log_file(p)
-        for ds_dir in sorted([p for p in root.iterdir() if p.is_dir()])
+        for ds_dir in sorted(subdirs)
         for p in sorted(ds_dir.glob("*.out"))
     ])
 
@@ -123,8 +141,8 @@ def initialize_template():
     return {
         k: None
         for k in (
-            [m for m in MODEL_FAMILIES] +
-            [f"dir-{m}_alpha_{a}" for m in MODEL_FAMILIES for a in ["0.0", "1.0", "0.5"]]
+            list(MODEL_FAMILIES)
+            + [f"dir-{m}_alpha_{a}" for m in MODEL_FAMILIES for a in ["0.0", "1.0", "0.5"]]
         )
     }
 
@@ -162,48 +180,128 @@ def get_variant_result(dataset_results, model_family, variant):
     raise ValueError(f"Unknown variant: {variant}")
 
 
-def format_dataset_label(name):
-    return name.replace("_", "-").upper()
+def format_dataset_short(name):
+    return (
+        name.replace("amazon-", "amz-")
+            .replace("coauthor-", "coa-")
+            .replace("citeseer_", "citeseer-")
+            .replace("cora_", "cora-")
+            .replace("_", "-")
+            .upper()
+    )
 
 
 def build_categories(results, dataset_names):
-    return [(ds, m.upper()) for ds in dataset_names if ds in results for m in MODEL_FAMILIES]
+    return [(ds, m) for ds in dataset_names if ds in results for m in MODEL_FAMILIES]
 
 
-def plot_grouped_bars(categories, series, title, output_path, ylabel="Test Accuracy (%)", ylim=(0, 100)):
-    if not categories or not any(any(not math.isnan(v) for v in s["means"]) for s in series):
+def _compute_dataset_spans(categories):
+    spans = []
+    if not categories:
+        return spans
+
+    start = 0
+    current_ds = categories[0][0]
+    for i, (ds, _) in enumerate(categories[1:], start=1):
+        if ds != current_ds:
+            spans.append((current_ds, start, i - 1))
+            current_ds = ds
+            start = i
+    spans.append((current_ds, start, len(categories) - 1))
+    return spans
+
+
+def _finite_values(series):
+    vals = []
+    for s in series:
+        vals.extend([v for v in s["means"] if not math.isnan(v)])
+    return vals
+
+
+def plot_grouped_bars(categories, series, title, output_path, ylabel="Test Accuracy (%)", ylim=None):
+    finite_vals = _finite_values(series)
+    if not categories or not finite_vals:
         return
 
     n = len(categories)
     k = len(series)
     x = list(range(n))
-    width = min(0.82 / max(k, 1), 0.36)
+    width = min(0.78 / max(k, 1), 0.32)
 
-    fig_w = max(12, 0.5 * n + 2)
-    fig, ax = plt.subplots(figsize=(fig_w, 5.8))
+    if ylim is None:
+        ymin = max(0, 5 * math.floor((min(finite_vals) - 4) / 5))
+        ymax = min(100, 5 * math.ceil((max(finite_vals) + 3) / 5))
+        if ymax - ymin < 20:
+            ymin = max(0, ymax - 20)
+        ylim = (ymin, ymax)
+
+    fig_w = max(12.5, 0.42 * n + 4.2)
+    fig, ax = plt.subplots(figsize=(fig_w, 5.9))
 
     offsets = [((i - (k - 1) / 2) * width) for i in range(k)]
-    for off, s in zip(offsets, series):
+
+    for band_idx, (_, start, end) in enumerate(_compute_dataset_spans(categories)):
+        if band_idx % 2 == 0:
+            ax.axvspan(start - 0.5, end + 0.5, alpha=0.04, color="black", zorder=0)
+        if end < n - 1:
+            ax.axvline(end + 0.5, color="0.75", linewidth=0.7, zorder=1)
+
+    for i, (off, s) in enumerate(zip(offsets, series)):
+        means = s["means"]
+        stds = [0.0 if math.isnan(v) else v for v in s["stds"]]
         ax.bar(
             [xi + off for xi in x],
-            s["means"],
+            means,
             width=width,
-            yerr=s["stds"],
-            capsize=2.5,
+            yerr=stds,
+            capsize=2.3,
+            color=SERIES_COLORS[i % len(SERIES_COLORS)],
+            edgecolor="white",
+            linewidth=0.7,
+            error_kw={"elinewidth": 0.8, "capthick": 0.8},
             label=s["label"],
-            edgecolor="black",
-            linewidth=0.4,
+            zorder=3,
         )
 
-    ax.set_title(title, pad=10)
+    ax.set_xticks(x)
+    ax.set_xticklabels([MODEL_DISPLAY[m] for _, m in categories])
+
+    y_top = ylim[1]
+    for ds, start, end in _compute_dataset_spans(categories):
+        center = (start + end) / 2
+        ax.text(
+            center,
+            y_top - 0.6,
+            format_dataset_short(ds),
+            ha="center",
+            va="top",
+            fontsize=9,
+            fontweight="bold",
+        )
+
     ax.set_ylabel(ylabel)
     ax.set_ylim(*ylim)
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"{format_dataset_label(ds)}\n{model}" for ds, model in categories], rotation=50, ha="right")
-    ax.grid(axis="y")
-    ax.legend(frameon=False, ncol=min(len(series), 2), loc="upper left")
-    fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
+    ax.set_xlim(-0.7, n - 0.3)
+    ax.set_title(title, pad=12)
+    ax.grid(axis="y", zorder=0)
+
+    legend_handles = [
+        Patch(facecolor=SERIES_COLORS[i % len(SERIES_COLORS)], edgecolor="none", label=s["label"])
+        for i, s in enumerate(series)
+    ]
+    ax.legend(
+        handles=legend_handles,
+        frameon=False,
+        ncol=min(3, len(series)),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.15),
+        columnspacing=1.5,
+        handlelength=1.4,
+    )
+
+    plt.setp(ax.get_xticklabels(), rotation=0, ha="center")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path)
     plt.close(fig)
     print(f"Saved {output_path}")
 
@@ -212,10 +310,9 @@ def plot_model_vs_directed(results, dataset_names, group_name, exp_name, output_
     categories = build_categories(results, dataset_names)
     gnn_means, gnn_stds, dir_means, dir_stds = [], [], [], []
 
-    for ds, model_up in categories:
-        m = model_up.lower()
-        r_gnn = get_variant_result(results[ds], m, "gnn")
-        r_dir = get_variant_result(results[ds], m, "directed")
+    for ds, model in categories:
+        r_gnn = get_variant_result(results[ds], model, "gnn")
+        r_dir = get_variant_result(results[ds], model, "directed")
 
         gnn_means.append(float("nan") if r_gnn is None else r_gnn["mean"])
         gnn_stds.append(float("nan") if r_gnn is None else (0.0 if is_missing(r_gnn["std"]) else r_gnn["std"]))
@@ -223,13 +320,13 @@ def plot_model_vs_directed(results, dataset_names, group_name, exp_name, output_
         dir_stds.append(float("nan") if r_dir is None else (0.0 if is_missing(r_dir["std"]) else r_dir["std"]))
 
     plot_grouped_bars(
-        categories,
-        [
-            {"label": "GNN", "means": gnn_means, "stds": gnn_stds},
-            {"label": "Directed GNN", "means": dir_means, "stds": dir_stds},
+        categories=categories,
+        series=[
+            {"label": "Baseline GNN", "means": gnn_means, "stds": gnn_stds},
+            {"label": "Best Directed GNN", "means": dir_means, "stds": dir_stds},
         ],
-        title=f"{group_name.capitalize()} datasets — {exp_name}",
-        output_path=output_dir / f"{group_name}_{exp_name}_gnn_vs_directed.pdf",
+        title=f"{group_name.capitalize()} datasets",
+        output_path=output_dir / f"{group_name}_{exp_name}_gnn_vs_directed_paper.pdf",
     )
 
 
@@ -237,10 +334,9 @@ def plot_folder_comparison(results_a, results_b, dataset_names, group_name, labe
     categories = sorted(set(build_categories(results_a, dataset_names)) | set(build_categories(results_b, dataset_names)))
     a_means, a_stds, b_means, b_stds = [], [], [], []
 
-    for ds, model_up in categories:
-        m = model_up.lower()
-        ra = get_variant_result(results_a.get(ds, {}), m, variant) if ds in results_a else None
-        rb = get_variant_result(results_b.get(ds, {}), m, variant) if ds in results_b else None
+    for ds, model in categories:
+        ra = get_variant_result(results_a.get(ds, {}), model, variant) if ds in results_a else None
+        rb = get_variant_result(results_b.get(ds, {}), model, variant) if ds in results_b else None
 
         a_means.append(float("nan") if ra is None else ra["mean"])
         a_stds.append(float("nan") if ra is None else (0.0 if is_missing(ra["std"]) else ra["std"]))
@@ -249,13 +345,13 @@ def plot_folder_comparison(results_a, results_b, dataset_names, group_name, labe
 
     title_variant = "GNN" if variant == "gnn" else "Directed GNN"
     plot_grouped_bars(
-        categories,
-        [
+        categories=categories,
+        series=[
             {"label": label_a, "means": a_means, "stds": a_stds},
             {"label": label_b, "means": b_means, "stds": b_stds},
         ],
-        title=f"{group_name.capitalize()} datasets — {title_variant}: {label_a} vs {label_b}",
-        output_path=output_dir / f"{group_name}_{variant}_{label_a}_vs_{label_b}.pdf",
+        title=f"{group_name.capitalize()} datasets — {title_variant}",
+        output_path=output_dir / f"{group_name}_{variant}_{label_a}_vs_{label_b}_paper.pdf",
     )
 
 
@@ -274,7 +370,7 @@ def sanitize_name(path_str):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--folder1", help="First root logs folder", default="logs/run")
+    p.add_argument("--folder1", default="logs/run", help="First root logs folder")
     p.add_argument("--folder2", nargs="?", default="logs/run_bidir", help="Second root logs folder")
     p.add_argument("--label1", default="baseline", help="Legend label for folder1")
     p.add_argument("--label2", default="bidirected", help="Legend label for folder2")
